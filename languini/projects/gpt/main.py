@@ -37,11 +37,11 @@ import sys
 import torch
 import torch.multiprocessing as mp
 
-from languini.train_lib import lm_trainer
+from languini.train_lib import lm_trainer, train_utils
 from languini.train_lib import lr_schedules
 from languini.common_lib import parallel_utils
 from languini.common_lib import experiment_utils
-from languini.dataset_lib import languini_books
+from languini.dataset_lib import languini_books, multilingual
 
 from languini.common_lib.parallel_utils import mprint
 from languini.common_lib.parallel_utils import LOCAL_RANK, WORLD_RANK, WORLD_SIZE
@@ -62,17 +62,18 @@ def run(config, logger):
     mprint(f"WORLD_RANK: {WORLD_RANK}")  # unique id within all devices
     mprint(f"LOCAL_RANK: {LOCAL_RANK}")  # unique id within the devices of this node
 
+    ## Setup dataset
     mprint("Setup data sources ... ")
     # Compute the batch indices for this accelerator.
     assert c.train_batch_size % WORLD_SIZE == 0, "train batch size has to be a multiple of the number of workers"
     assert c.eval_batch_size % WORLD_SIZE == 0, "eval batch size has to be a multiple of the number of workers"
     train_batch_idxs = [i for i in range(c.train_batch_size) if i % WORLD_SIZE == WORLD_RANK]
     eval_batch_idxs = [i for i in range(c.eval_batch_size) if i % WORLD_SIZE == WORLD_RANK]
-
     END_OF_DOC_TOKEN = 2
     full_data_path = os.path.join(c.data_root, c.dataset)
     mprint(f"Loading data from {full_data_path}")
-    train_ds = languini_books.LanguiniDatasetIterator(
+    sp = train_utils.load_tokeniser(name=c.dataset)
+    train_ds_args = dict(
         data_path=full_data_path,
         split='train',
         repeat=True,
@@ -82,8 +83,9 @@ def run(config, logger):
         sequence_length=c.seq_len,
         device=c.device,
         end_of_doc_token=END_OF_DOC_TOKEN,
+        sp=sp,
     )
-    eval_ds = languini_books.LanguiniDatasetIterator(
+    eval_ds_args = dict(
         data_path=full_data_path,
         split='test',
         repeat=False,
@@ -93,7 +95,51 @@ def run(config, logger):
         sequence_length=c.seq_len,
         device=c.device,
         end_of_doc_token=END_OF_DOC_TOKEN,
+        sp=sp,
     )
+    if c.num_cloned_languages > 0:
+        # Cloned dataset
+        assert not c.data_root_2
+        clone_args = dict(
+            num_languages=c.num_cloned_languages + 1,
+            p_clone=c.p_clone,
+            frac_clone=c.frac_clone,
+        )
+        train_ds = multilingual.ClonedLanguageDataset(**train_ds_args, **clone_args)
+        eval_ds = multilingual.ClonedLanguageDataset(**eval_ds_args, **clone_args)
+    elif c.data_root_2:
+        # Bilingual dataset
+        full_data_path_2 = os.path.join(c.data_root_2, c.dataset_2)
+        mprint(f"Loading data from {full_data_path_2}")
+        bilingual_args = dict(
+            data_path_2=full_data_path_2,
+            sp2=train_utils.load_tokeniser(name=c.dataset_2),
+            merge_vocab=c.merge_vocab,
+            p_l2=c.p_l2,
+        )
+        train_ds = multilingual.BilingualDataset(**train_ds_args, **bilingual_args)
+        eval_ds = multilingual.BilingualDataset(**eval_ds_args, **bilingual_args)
+        c.vocab_size = train_ds.vocab_size
+    else:
+        # Standard monolingual dataset
+        train_ds = languini_books.LanguiniDatasetIterator(**train_ds_args)
+        eval_ds = languini_books.LanguiniDatasetIterator(**eval_ds_args)
+    assert train_ds.vocab_size == eval_ds.vocab_size
+    c.vocab_size = train_ds.vocab_size
+    logger.save_file(config, "config.pickle", overwrite=True) # update config with vocab size TODO cleaner solution
+
+    ## Setup language schedule
+    if c.language_schedule:
+        mprint("Using language schedule ...")
+        assert c.num_cloned_languages > 0 or c.data_root_2
+        language_scheduler = multilingual.LanguageScheduler(
+            c.language_schedule,
+            n_total_steps=c.max_train_steps,
+            datasets=[train_ds, eval_ds],
+            attr_name="p_l2" if c.data_root_2 else "p_clone",
+        )
+    else:
+        language_scheduler = None
 
     ## Setup Model
     mprint("Build model ... ")
@@ -123,7 +169,8 @@ def run(config, logger):
                                    opt=opt,
                                    scheduler=scheduler,
                                    train_batches=train_ds,
-                                   eval_batches=eval_ds)
+                                   eval_batches=eval_ds,
+                                   language_scheduler=language_scheduler)
 
     mprint("Begin training ... ")
     trainer.train()

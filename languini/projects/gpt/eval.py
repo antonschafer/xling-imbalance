@@ -35,7 +35,7 @@ import torch.multiprocessing as mp
 
 from languini.train_lib import lm_trainer
 from languini.train_lib import train_utils
-from languini.dataset_lib import languini_books
+from languini.dataset_lib import languini_books, multilingual
 from languini.common_lib import debug_utils
 from languini.common_lib import common_utils
 from languini.common_lib import parallel_utils
@@ -45,25 +45,14 @@ from languini.common_lib.parallel_utils import LOCAL_RANK, WORLD_RANK, WORLD_SIZ
 
 from model import Model
 
-def run(config):
+def run(config, language):
     c = config
     mprint(f"WORLD_SIZE: {WORLD_SIZE}")  # total number of devices
     mprint(f"WORLD_RANK: {WORLD_RANK}")  # unique id within all devices
     mprint(f"LOCAL_RANK: {LOCAL_RANK}")  # unique id within the devices of this node
     
-    # Build model and load it from checkpoint
-    torch.manual_seed(c.seed)
-    model = Model(config=c)
-    if c.compile != "None":
-        model = torch.compile(model, mode=c.compile)
-    model = model.to(c.device)
-    device_ids = [LOCAL_RANK] if c.device.type == "cuda" else None
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=device_ids)  # we always use DDP so we can easily load models 
-    model, curr_state = train_utils.load_checkpoint(model, c.checkpoint_file)
-    mprint(f"Model checkpoint and state loaded from {c.checkpoint_file}")
-
     # load tokeniser
-    sp = train_utils.load_tokeniser(config=c)
+    sp = train_utils.load_tokeniser(name=c.dataset)
 
     # eval
     c.eval_batch_size = 1
@@ -80,7 +69,7 @@ def run(config):
     mprint(f"Loading split \"{c.eval_data_split}\" from {full_data_path}")
     
     # Compute the number of bytes in the data that we evaluate to correctly compute the normalised loss and ppl
-    ds = languini_books.LanguiniDatasetIterator(
+    ds_args = dict(
         data_path=full_data_path,
         split=c.eval_data_split,
         repeat=False,
@@ -91,13 +80,55 @@ def run(config):
         device=c.device,
         end_of_doc_token=END_OF_DOC_TOKEN,
         shift_n=c.last_n,
+        sp=sp,
     )
+    if c.num_cloned_languages > 0:
+        # Cloned dataset
+        assert language in ["L1", "L2"]
+        assert not c.data_root_2
+        ds = multilingual.ClonedLanguageDataset(
+            num_languages=2, # HACK
+            p_clone=0 if language == "L1" else 1,
+            frac_clone=c.frac_clone,
+            **ds_args,
+        )
+        # HACK: this (along with num_languages=2 above) is a nasty hack to always use L2 even if we have L3, L4, ...
+        # TODO: solve cleaner
+        ds.vocab_size = ds.original_vocab_size * (1 + c.num_cloned_languages)
+    elif c.data_root_2:
+        # Bilingual dataset
+        assert language in ["L1", "L2"]
+        full_data_path_2 = os.path.join(c.data_root_2, c.dataset_2)
+        mprint(f"Loading \"{c.eval_data_split}\" from {full_data_path_2}")
+        ds = multilingual.BilingualDataset(
+            data_path_2=full_data_path_2,
+            p_l2=0 if language == "L1" else 1,
+            merge_vocab=c.merge_vocab,
+            sp2=train_utils.load_tokeniser(name=c.dataset_2),
+            **ds_args,
+        )
+    else:
+        # Standard monolingual dataset
+        assert not language
+        ds = languini_books.LanguiniDatasetIterator(**ds_args)
+    assert c.get("vocab_size") is None or c.vocab_size == ds.vocab_size
+    c.vocab_size = ds.vocab_size
+
+    # Build model and load it from checkpoint
+    torch.manual_seed(c.seed)
+    model = Model(config=c)
+    if c.compile != "None":
+        model = torch.compile(model, mode=c.compile)
+    model = model.to(c.device)
+    device_ids = [LOCAL_RANK] if c.device.type == "cuda" else None
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=device_ids)  # we always use DDP so we can easily load models 
+    model, curr_state = train_utils.load_checkpoint(model, c.checkpoint_file)
+    mprint(f"Model checkpoint and state loaded from {c.checkpoint_file}")
 
     mprint("Measure test data size ...")
     eval_bytes, batch_count, token_count = lm_trainer.log_eval_stats(eval_data_source=ds,
                                                                         eval_steps=c.max_eval_steps,
                                                                         last_n=c.last_n,
-                                                                        sp=sp,
                                                                         logger=None,
                                                                         device=c.device)
     mprint(f"number of bytes: {eval_bytes:,}")
@@ -141,6 +172,16 @@ def run(config):
     
     mprint("Done!")
 
+    return {
+        "num_tokens": int(eval_token_count),
+        "total_loss": float(eval_total_loss),
+        "avg_loss": float(eval_avg_loss),
+        "ppl": float(eval_ppl),
+        "normalised_loss": float(eval_norm_loss),
+        "normalised_ppl": float(eval_norm_ppl),
+        **{f"top-{k}": float(v) for k, v in eval_topk_accs.items()},
+    }
+
 
 def main():
     """Load relevant args and evaluate on some data split."""
@@ -159,6 +200,7 @@ def main():
     parser.add_argument("--wandb_run", default="", type=str, help=f"Wandb run to load model config and checkpoint from.")
     parser.add_argument("--eval_data_split", default="test", type=str, help=f"Name of the languini books split to do eval on.")
     parser.add_argument("--last_n", default=-1, type=int, help=f"Last n tokens to evaluate in the sequence.")
+    parser.add_argument("--language", default="", type=str, help=f"Language to evaluate in. Required for multilingual runs.")
     args = parser.parse_args(sys.argv[1:])
 
     # download file from wandb if necessary
@@ -180,7 +222,22 @@ def main():
     config.last_n = args.last_n if args.last_n > 0 else config.seq_len
     config.device = device
 
-    run(config)
+    metrics = run(config, language=args.language)
+
+    # name the results
+    results_identifier = f"{args.eval_data_split}_{args.last_n}"
+    if args.language:
+        results_identifier += f"_{args.language}"
+
+    if args.wandb_run:
+        print("Uploading results to wandb ...")
+        # update the run's summary metrics
+        experiment_utils.log_wandb_summary_metrics(
+            args.wandb_run,
+            {f"{results_identifier}/{k}": v for k, v in metrics.items()}
+        )
+
+    print("Done.")
 
 
 if __name__ == "__main__":

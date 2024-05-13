@@ -117,7 +117,6 @@ def main(books3_dir, spm_model_path, split_npy_file, output_dir):
     sp.Load(spm_model_path)
 
     # Load file_list
-    books3_dir = os.path.join(books3_dir, "books3")
     print(f"Checking if all files exist in {books3_dir} ...")
     file_names = [os.path.splitext(os.path.basename(fn))[0] for fn in np.load(split_npy_file)[:,0]]
     books3_file_paths = get_books3_file_paths(books3_dir, file_names)
@@ -146,10 +145,12 @@ if __name__ == "__main__":
     parser.add_argument("--split_npy_file", required=True, help="Path to the Languini npy file containing selected books")
     parser.add_argument("--spm_model", required=True, help="Path to SentencePiece model")
     parser.add_argument("--books3_dir", default='data', help="Path to books3 directory with the raw dataset")
+    parser.add_argument("--books3_subdir", default='books3', help="Subdirectory, if data in different file structure when not using books3 but e.g. french books")
     parser.add_argument("--output_dir", default='data/books', help="Path to the output directory")
     args = parser.parse_args()
 
-    main(args.books3_dir, 
+    books3_dir = os.path.join(args.books3_dir, args.books3_subdir)
+    main(books3_dir, 
          args.spm_model, 
          args.split_npy_file, 
          args.output_dir)

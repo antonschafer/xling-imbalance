@@ -46,8 +46,8 @@ def get_param_count(model):
   return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def load_tokeniser(config):
-  vocab_path = os.path.join(os.getcwd(), 'languini/vocabs/spm_models', f"{config.dataset}.model")
+def load_tokeniser(name):
+  vocab_path = os.path.join(os.getcwd(), 'languini/vocabs/spm_models', f"{name}.model")
   mprint(f"load vocab from: {vocab_path}")
   sp = spm.SentencePieceProcessor()
   if not sp.Load(vocab_path):

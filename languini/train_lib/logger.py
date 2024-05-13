@@ -231,7 +231,7 @@ class Logger:
             self.tb_writer.add_text(log_key, log_text, step)
 
 
-    def save_file(self, obj, filename):
+    def save_file(self, obj, filename, overwrite=False):
         """
         Save object to a file. If wandb is used, the file is saved to the wandb run dir.
 
@@ -240,6 +240,7 @@ class Logger:
         Args:
             obj: object to save
             name: name of the file (with extension)
+            overwrite: allow overwriting
         Returns:
             path to the saved file
         """
@@ -253,7 +254,7 @@ class Logger:
         
         # make directory if necessary
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        assert not os.path.exists(save_path), f"File {save_path} already exists"
+        assert overwrite or not os.path.exists(save_path), f"File {save_path} already exists"
 
         if filename.endswith(".pt"):
             torch.save(obj, save_path)
