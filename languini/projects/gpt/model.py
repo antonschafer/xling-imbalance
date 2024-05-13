@@ -70,7 +70,7 @@ class Model(torch.nn.Module):
     def get_init_state(self, batch_size, device):
        return None
     
-    def forward(self, x, state, log=None):
+    def forward(self, x, state, log=None, return_hidden=False):
         # x: [batch_size, seq_length]
         bsz, seqlen = x.shape
         c = self.c
@@ -86,17 +86,23 @@ class Model(torch.nn.Module):
         check(pos, (1, seqlen, c.h_dim))
         x = x + pos
 
+        hidden_states = []
         # forward
         for layer in self.layers:
             x = layer(x, log=log)
             check(x, (bsz, seqlen, c.h_dim))
+            if return_hidden:
+                hidden_states.append(x.detach().clone())
         
         # project to vocab
         x = self.ln_f(x, log=log)
         x = self.linear(x)
         check(x, (bsz, seqlen, c.vocab_size))
         
-        return x, state
+        if return_hidden:
+            return x, state, torch.stack(hidden_states)
+        else:
+            return x, state
 
 
 if __name__ == "__main__":

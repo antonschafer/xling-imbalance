@@ -150,7 +150,7 @@ def update_config_given_args(config, args, verbose=True):
     return config
 
 
-def load_wandb_files(run_path, exclude=None, include=None):
+def load_wandb_files(run_path, exclude=None, include=None, cache_dir=None):
     """
     Downloads all files of a wandb run into a cache directory if not cached already
 
@@ -158,7 +158,8 @@ def load_wandb_files(run_path, exclude=None, include=None):
         run_path: The wandb run path
         exclude: A list of regex patterns to exclude from download (default is none)
         include: A list of regex patterns to include in download (default is all)
-    
+        cache_dir: The directory to cache the files in (default is cwd/cache)
+ 
     Returns:
         The path to the directory with the run's files
     """
@@ -166,7 +167,10 @@ def load_wandb_files(run_path, exclude=None, include=None):
     run = api.run(run_path)
     files = run.files()
 
-    run_dir = os.path.join(os.getcwd(), "cache", run_path.replace("/", "_"))
+    if cache_dir is None:
+        cache_dir = os.path.join(os.getcwd(), "cache")
+    run_id = run_path.split("/")[-1]
+    run_dir = os.path.join(cache_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
 
     for file in files:
@@ -184,6 +188,14 @@ def load_wandb_files(run_path, exclude=None, include=None):
     return run_dir 
 
 
+def load_wandb_file(run_path, fname, cache_dir=None):
+    run_dir = load_wandb_files(run_path, include=[fname], cache_dir=cache_dir)
+    local_fname = os.path.join(run_dir, fname)
+    if not os.path.exists(local_fname):
+        raise FileNotFoundError(f"Could not load file {fname} from wandb run {run_path}")
+    return local_fname
+
+
 def load_wandb_checkpoint_and_config(run_path):
     """
     Load a checkpoint and config from a wandb run path.
@@ -197,3 +209,13 @@ def load_wandb_checkpoint_and_config(run_path):
         raise FileNotFoundError(f"Could not load config file from wandb run {run_path}")
     return checkpoint_file, config_file
 
+
+def log_wandb_summary_metrics(run_path, metrics):
+    """
+    Add metrics to the summary of a wandb run.
+    """
+    project, run_id = run_path.split("/")[-2:]
+    wandb.init(project=project, resume="must", id=run_id)
+    for k, v in metrics.items():
+        wandb.summary[k] = v
+    wandb.finish()
